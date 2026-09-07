@@ -11,10 +11,12 @@ netfix.py - 网络诊断与自动修复引擎（被 campus_net_guard.py 调用�
 """
 
 import ctypes
+import http.client
 import re
 import socket
 import subprocess
 import time
+from urllib.parse import urlparse, parse_qs
 
 try:
     import winreg
@@ -537,3 +539,179 @@ class RepairEngine:
 
 def _state_cn(state):
     return {"ONLINE": "已联网", "NEED_AUTH": "需要认证", "OFFLINE": "网络未连接"}.get(state, state)
+
+
+# --------------------------------------------------------------------------
+# 认证地址自动发现
+# --------------------------------------------------------------------------
+
+# 用来触发网关重定向的探测地址。必须用 http：https 在未认证时会被证书拦截，拿不到重定向
+DISCOVERY_URLS = [
+    "http://captive.apple.com/hotspot-detect.html",
+    "http://www.msftconnecttest.com/connecttest.txt",
+    "http://connect.rom.miui.com/generate_204",
+    "http://www.baidu.com/",
+]
+
+# 认证页的"味道"：URL 参数或页面正文出现这些词，基本就是 portal
+PORTAL_HINTS = ("wlanacname", "wlanacip", "userip", "portal", "login", "logout",
+                "auth", "认证", "登录", "注销", "上网")
+
+# 探测网关/DHCP/DNS 这类内网地址时用更严格的特征，否则随便一个含 "login" 的
+# 设备管理页都会被误当成认证页
+STRONG_HINTS = ("wlanacname", "wlanacip", "userip", "portal")
+
+
+def _is_private_ip(ip):
+    try:
+        a, b = int(ip.split(".")[0]), int(ip.split(".")[1])
+    except Exception:
+        return False
+    if a == 10:
+        return True
+    if a == 172 and 16 <= b <= 31:
+        return True
+    if a == 192 and b == 168:
+        return True
+    if a == 100 and 64 <= b <= 127:  # 部分校园网用运营商级 NAT 地址
+        return True
+    return False
+
+
+def raw_get(url, timeout=5):
+    """发一个不跟随重定向的 GET，返回 (status, headers, body)。
+    用 http.client 而不是 urllib：它不读系统代理，正好避免代理干扰探测。"""
+    u = urlparse(url)
+    host = u.hostname
+    port = u.port or (443 if u.scheme == "https" else 80)
+    factory = (http.client.HTTPSConnection if u.scheme == "https"
+               else http.client.HTTPConnection)
+    conn = factory(host, port, timeout=timeout)
+    try:
+        conn.request("GET", u.path or "/", headers={
+            "User-Agent": "Mozilla/5.0 CampusNetGuard",
+            "Connection": "close",
+        })
+        r = conn.getresponse()
+        body = r.read(16384)
+        headers = {k.lower(): v for k, v in r.getheaders()}
+        return r.status, headers, body
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _looks_like_portal(url, body, strong=False):
+    text = (url or "").lower()
+    try:
+        text += " " + (body.decode("utf-8", "ignore") if isinstance(body, bytes)
+                       else str(body)).lower()
+    except Exception:
+        pass
+    hints = STRONG_HINTS if strong else PORTAL_HINTS
+    return any(h in text for h in hints)
+
+
+def _internal_candidates():
+    """从 ipconfig /all 里挑内网地址（网关、DHCP、DNS 服务器）当候选。"""
+    rc, out = run_system_cmd(["ipconfig", "/all"], timeout=25)
+    found, seen = [], set()
+    for line in out.splitlines():
+        if not re.search(r"(网关|Gateway|DHCP|DNS)", line):
+            continue
+        for m in re.finditer(r"(\d+\.\d+\.\d+\.\d+)", line):
+            ip = m.group(1)
+            if ip.startswith("255.") or ip.endswith(".0") or ip.endswith(".255"):
+                continue  # 子网掩码之类的噪声
+            if ip in seen or not _is_private_ip(ip):
+                continue
+            seen.add(ip)
+            found.append(ip)
+    return found[:6]
+
+
+def _candidate_from_url(url):
+    """把发现的 URL 转成 portal 配置（字段与主程序 portals 项一致）。"""
+    if "://" not in url:
+        url = "http://" + url
+    u = urlparse(url)
+    q = parse_qs(u.query)
+    return {
+        "name": "自动发现",
+        "host": u.hostname or "",
+        "path": u.path or "/",
+        "wlanacip": (q.get("wlanacip") or [""])[0],
+        "with_userip": "userip" in q,
+        "https": u.scheme == "https",
+    }
+
+
+def discover_portal(cfg, log=None, timeout=5):
+    """自动发现校园网认证地址。
+
+    原理：未认证时网关会把 http 请求 302 到认证页，抓住这个 Location 就行，
+    而且重定向 URL 里通常已带 userip、wlanacip 等参数，本机 IP 一并解决了。
+    抓不到重定向时（比如已经认证过），退而探测网关/DHCP/DNS 等内网地址是不是 portal。
+
+    注意：已经能正常上网时是发现不了的——那会儿网关不做任何重定向，这是正常现象。
+    """
+    log = log or (lambda msg, level="info": None)
+    known = {p.get("host") for p in (cfg.get("portals") or []) if p.get("host")}
+    found_urls = []
+
+    # 1) 捕获重定向
+    for url in DISCOVERY_URLS:
+        try:
+            status, headers, body = raw_get(url, timeout)
+        except Exception:
+            continue
+        loc = headers.get("location")
+        if status in (301, 302, 303, 307, 308) and loc:
+            log("捕获重定向：%s → %s" % (url, loc))
+            found_urls.append(loc)
+            break
+        if status == 200:
+            # 有些网关用 meta refresh 或 JS 跳转，而不是 302
+            text = body.decode("utf-8", "ignore")
+            m = re.search(
+                r"""(?:URL=|url=|href\s*=\s*['"]|location\.href\s*=\s*['"]?)(https?://[^'"\s<>]+)""",
+                text)
+            if m and _looks_like_portal(m.group(1), b""):
+                log("页面内跳转到：%s" % m.group(1))
+                found_urls.append(m.group(1))
+
+    # 2) 只在没抓到重定向时才退而探测内网地址：重定向的结果更准确，别让它被误判干扰
+    if not found_urls:
+        try:
+            for ip in _internal_candidates():
+                if ip in known:
+                    continue
+                try:
+                    status, headers, body = raw_get("http://%s/" % ip, timeout)
+                except Exception:
+                    continue
+                if status and status < 500 and _looks_like_portal(ip, body, strong=True):
+                    log("内网地址 %s 响应了认证页特征" % ip)
+                    found_urls.append("http://%s/" % ip)
+        except Exception as e:
+            log("探测内网地址时出错：%s" % e, "warn")
+
+    # 3) 挑一个没见过、且确实能打开的
+    for url in found_urls:
+        if not url.startswith("http"):
+            url = "http://" + url
+        host = urlparse(url).hostname
+        if not host or host in known:
+            continue
+        try:
+            status, _h, _b = raw_get(url, timeout)
+        except Exception:
+            continue
+        if status and status < 500:
+            log("确认可用的认证地址：%s" % url, "ok")
+            return _candidate_from_url(url)
+
+    log("未能自动发现新的认证地址", "info")
+    return None

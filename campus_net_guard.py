@@ -45,7 +45,7 @@ CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 LOG_FILE = os.path.join(BASE_DIR, "campus_net_guard.log")
 
 DEFAULT_CONFIG = {
-    # 认证服务器候选列表。这里填你学校认证服务器的地址，域名和内网 IP 通常指向同一台。
+    # 认证服务器候选列表。实测 portal.example.edu.cn 解析到 10.0.0.1，是同一台服务器。
     # 顺序即优先级：内网 IP 排第一（不依赖校园 DNS，更稳），域名作为兜底。
     "portals": [
         {"name": "校园网（内网 IP）", "host": "10.0.0.1", "path": "/",
@@ -509,11 +509,17 @@ def run_gui(cfg):
     buttons = []
 
     def set_buttons_enabled(enabled):
+        # 任一长时间操作进行中时，按钮保持禁用，避免被误点或在操作间打架
+        active = checking[0] or repairing[0] or discovering[0]
+        actual = enabled and not active
         for b, primary in buttons:
-            b.configure(bg=(ACCENT if enabled else "#2f5a86") if primary
-                        else ("#333333" if enabled else "#2a2a2a"))
-            b.configure(fg=("#ffffff" if primary else FG) if enabled else "#6a6a6a")
-            b.configure(cursor="hand2" if enabled else "arrow")
+            b.configure(bg=(ACCENT if actual else "#2f5a86") if primary
+                        else ("#333333" if actual else "#2a2a2a"))
+            b.configure(fg=("#ffffff" if primary else FG) if actual else "#6a6a6a")
+            b.configure(cursor="hand2" if actual else "arrow")
+
+    def _maybe_enable():
+        set_buttons_enabled(True)
 
     def do_check():
         if checking[0]:
@@ -590,18 +596,20 @@ def run_gui(cfg):
     def finish_check(elapsed):
         prog.configure(value=prog["maximum"])
         checking[0] = False
-        set_buttons_enabled(True)
+        _maybe_enable()
         text, color = STATE_TEXT.get(core.state, ("未知", SUB))
         step_label.configure(text="检测完成 · %s · 用时 %.1fs" % (text, elapsed), fg=color)
         ui_log("检测完成：%s（用时 %.1fs）" % (text, elapsed),
                "ok" if core.state == ONLINE else
                ("warn" if core.state == NEED_AUTH else "error"))
-        # 只要不是"已联网"，就接着走诊断 + 自动修复，别让用户干瞪眼
+        # 只要不是"已联网"，就接着走诊断 + 自动修复 + 自动发现地址
         if core.state != ONLINE:
             start_repair("网络异常，开始自动诊断与修复…")
+            do_discover()
 
     # ---------- 自动修复 ----------
     repairing = [False]
+    discovering = [False]
 
     def start_repair(reason=""):
         """先诊断再分级修复，每执行一步复测一次，网络恢复就收工。"""
@@ -660,7 +668,7 @@ def run_gui(cfg):
 
     def finish_repair(summary):
         repairing[0] = False
-        set_buttons_enabled(True)
+        _maybe_enable()
         if summary.get("fixed"):
             step_label.configure(text="自动修复完成 · 网络已恢复", fg="#4EC9B0")
             ui_log("自动修复完成：网络已恢复", "ok")
@@ -762,7 +770,7 @@ def run_gui(cfg):
     root.option_add("*TCombobox*Listbox*selectBackground", ACCENT)
 
     combo = ttk.Combobox(prefer_row, values=list(label_to_value.keys()),
-                         textvariable=preferred_var, state="readonly", width=28,
+                         textvariable=preferred_var, state="readonly", width=26,
                          font=("Microsoft YaHei UI", 9))
     combo.pack(side="left", padx=8)
 
@@ -775,6 +783,86 @@ def run_gui(cfg):
         threading.Thread(target=core.tick, daemon=True).start()
 
     combo.bind("<<ComboboxSelected>>", on_prefer_change)
+
+    # ---------- 自动发现认证地址 ----------
+    def refresh_portal_combo():
+        """重建下拉框选项，返回 标签->host 的映射。"""
+        nonlocal label_to_value, value_to_label
+        mapping = {"自动选择（推荐）": "auto"}
+        for p in cfg.get("portals", []):
+            mapping["%s · %s" % (p.get("name"), p.get("host"))] = p.get("host")
+        label_to_value = mapping
+        value_to_label = {v: k for k, v in mapping.items()}
+        combo["values"] = list(mapping.keys())
+        if preferred_var.get() not in mapping:
+            preferred_var.set("自动选择（推荐）")
+        return mapping
+
+    def finish_discover(portal):
+        discovering[0] = False
+        _maybe_enable()
+        if not portal or not portal.get("host"):
+            ui_log("未发现新的认证地址（已联网时网关不重定向，属正常现象）", "info")
+            step_label.configure(text="未发现新的认证地址", fg=SUB)
+            return
+        host = portal["host"]
+        known_hosts = {p.get("host") for p in cfg.get("portals", [])}
+        if host in known_hosts:
+            # 已存在：若新发现带了 userip 参数，则补上参数
+            for p in cfg["portals"]:
+                if p.get("host") == host and portal.get("with_userip") and not p.get("with_userip"):
+                    p["with_userip"] = True
+                    p["wlanacip"] = portal.get("wlanacip", "") or p.get("wlanacip", "")
+                    save_config(cfg)
+                    ui_log("已为已有地址 %s 补全认证参数" % host, "ok")
+                    break
+            ui_log("发现的地址 %s 已在列表中" % host, "ok")
+        else:
+            cfg["portals"].append({
+                "name": portal.get("name") or host,
+                "host": host,
+                "path": portal.get("path") or "/",
+                "wlanacip": portal.get("wlanacip") or "",
+                "with_userip": portal.get("with_userip", False),
+                "https": portal.get("https", False),
+            })
+            save_config(cfg)
+            ui_log("已添加并切换到新发现的认证地址：%s" % host, "ok")
+        # 自动切到新发现的地址，方便立刻用
+        cfg["preferred"] = host
+        core.cfg["preferred"] = host
+        save_config(cfg)
+        mapping = refresh_portal_combo()
+        for lbl, val in mapping.items():
+            if val == host:
+                preferred_var.set(lbl)
+                break
+        step_label.configure(text="发现并保存认证地址：%s" % host, fg="#4EC9B0")
+        threading.Thread(target=core.tick, daemon=True).start()
+
+    def do_discover():
+        if checking[0]:
+            return  # 正在检测就别并发发现
+        discovering[0] = True
+        set_buttons_enabled(False)
+        step_label.configure(text="正在自动发现认证地址…", fg=SUB)
+        ui_log("开始自动发现校园网认证地址（捕获网关重定向 / 探测内网地址）…", "info")
+
+        def worker():
+            try:
+                portal = netfix.discover_portal(
+                    cfg, log=lambda m, l="info": ui_log(m, l),
+                    timeout=cfg.get("timeout", 5))
+            except Exception as e:
+                ui_log("自动发现异常：%s" % e, "error")
+                portal = None
+            root.after(0, lambda p=portal: finish_discover(p))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    b_discover = btn(prefer_row, "自动发现", do_discover, padx=8)
+    b_discover.pack(side="left", padx=(8, 0))
+    buttons.extend([(b_discover, False)])
 
     options = tk.Frame(root, bg=BG)
     options.pack(fill="x", padx=12, pady=(4, 10))
