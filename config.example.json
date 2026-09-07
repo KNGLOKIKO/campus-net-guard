@@ -1,0 +1,25 @@
+{
+  "portals": [
+    {
+      "name": "校园网（内网 IP）",
+      "host": "10.0.0.1",
+      "path": "/",
+      "wlanacip": "",
+      "with_userip": false
+    },
+    {
+      "name": "校园网（域名）",
+      "host": "portal.example.edu.cn",
+      "path": "/",
+      "wlanacip": "10.0.0.254",
+      "with_userip": true
+    }
+  ],
+  "preferred": "auto",
+  "auto_open": true,
+  "cooldown": 180,
+  "interval_online": 60,
+  "interval_auth": 15,
+  "interval_offline": 10,
+  "timeout": 5
+}
